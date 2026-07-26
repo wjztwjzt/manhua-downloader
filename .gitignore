@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+downloads/
+manhua.db
+bot_config.py
+.DS_Store
+
+.claude/
