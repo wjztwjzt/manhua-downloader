@@ -7,8 +7,7 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/data/manhua
-Environment=HTTP_PROXY=socks5://127.0.0.1:10809
-Environment=HTTPS_PROXY=socks5://127.0.0.1:10809
+Environment=MANGA_PROXY=socks5://127.0.0.1:10809
 ExecStart=/data/manhua/.venv/bin/python bot.py
 Restart=on-failure
 RestartSec=10

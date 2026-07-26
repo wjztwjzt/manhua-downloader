@@ -3,8 +3,6 @@ import os
 import sys
 import time
 
-import requests
-
 import re
 
 from config import DOWNLOAD_DIR
@@ -21,6 +19,7 @@ from fetcher import (
     parse_manga_info,
     fetch_chapter_page,
     parse_chapter_images,
+    download_image,
 )
 
 
@@ -43,22 +42,6 @@ def _find_chapter(chapters, user_num):
         if s in ch["chapter_name"]:
             return ch
     return None
-
-
-def download_image(url, filepath, retries=3):
-    """下载单张图片到本地，支持重试"""
-    for attempt in range(retries):
-        try:
-            resp = requests.get(url, timeout=30)
-            if resp.status_code == 200:
-                os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                with open(filepath, "wb") as f:
-                    f.write(resp.content)
-                return True
-        except Exception:
-            if attempt < retries - 1:
-                time.sleep(1)
-    return False
 
 
 def cmd_download(manga_id, chapter_num):

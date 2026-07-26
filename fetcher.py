@@ -1,8 +1,9 @@
 import os
 import re
+import time
 import base64
 import requests
-from config import BASE_URL, MANGA_LIST_PATH, REQUEST_TIMEOUT
+from config import BASE_URL, MANGA_LIST_PATH, REQUEST_TIMEOUT, MANGA_PROXY
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G9910) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
@@ -18,11 +19,25 @@ def _get_session():
     if _session is None:
         _session = requests.Session()
         _session.headers.update(HEADERS)
-        # 支持 HTTP_PROXY / HTTPS_PROXY 环境变量
-        proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-        if proxy:
-            _session.proxies = {"http": proxy, "https": proxy}
+        if MANGA_PROXY:
+            _session.proxies = {"http": MANGA_PROXY, "https": MANGA_PROXY}
     return _session
+
+
+def download_image(url, filepath, retries=3):
+    """下载单张图片（通过代理访问漫画 CDN）"""
+    for attempt in range(retries):
+        try:
+            resp = _get_session().get(url, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 200:
+                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                with open(filepath, "wb") as f:
+                    f.write(resp.content)
+                return True
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(1)
+    return False
 
 
 def fetch_manga_page(manga_id):

@@ -8,14 +8,16 @@ import time
 from html import escape
 from logging.handlers import RotatingFileHandler
 
-import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 from telegram.error import TelegramError
 
 from bot_config import BOT_TOKEN, CHANNEL_ID
 from config import DOWNLOAD_DIR
-from fetcher import fetch_manga_page, parse_manga_info, fetch_chapter_page, parse_chapter_images
+from fetcher import (
+    fetch_manga_page, parse_manga_info, fetch_chapter_page,
+    parse_chapter_images, download_image,
+)
 
 RECENT_COUNT = 20
 
@@ -78,6 +80,11 @@ async def start(update, context):
     )
 
 
+async def _run_blocking(func, *args):
+    """在线程池中运行阻塞的同步函数"""
+    return await asyncio.to_thread(func, *args)
+
+
 async def cmd_recent(update, context):
     args = context.args
     if not args:
@@ -91,8 +98,8 @@ async def cmd_recent(update, context):
     msg = await update.message.reply_text("正在获取章节列表…")
 
     try:
-        html = fetch_manga_page(manga_id)
-        info = parse_manga_info(html, manga_id)
+        html = await _run_blocking(fetch_manga_page, manga_id)
+        info = await _run_blocking(parse_manga_info, html, manga_id)
     except Exception as e:
         _prog_logger.error("fetch manga failed: %s", e)
         await msg.edit_text(f"获取漫画信息失败: {escape(str(e))}")
@@ -127,6 +134,43 @@ async def cmd_recent(update, context):
     )
 
 
+def _do_download(manga_id, chapter_num):
+    """同步下载流程（在线程中运行，不阻塞事件循环）"""
+    info = parse_manga_info(fetch_manga_page(manga_id), manga_id)
+
+    target = _find_chapter_by_display(info["chapters"], chapter_num)
+    if target is None:
+        raise ValueError(f"未找到第 {chapter_num} 话")
+
+    chapter_html = fetch_chapter_page(target["url"])
+    image_urls = parse_chapter_images(chapter_html)
+    if not image_urls:
+        raise ValueError("未找到图片")
+
+    manga_dir = os.path.join(DOWNLOAD_DIR, manga_id, str(chapter_num))
+    os.makedirs(manga_dir, exist_ok=True)
+    local_files = []
+    failed = 0
+
+    for i, img_url in enumerate(image_urls, 1):
+        ext = img_url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
+        if ext not in ("jpg", "jpeg", "png", "webp", "gif"):
+            ext = "jpg"
+        filepath = os.path.join(manga_dir, f"{i:03d}.{ext}")
+        if download_image(img_url, filepath):
+            local_files.append(filepath)
+        else:
+            failed += 1
+
+    return {
+        "manga_name": info.get("name", manga_id),
+        "chapter_name": target["chapter_name"],
+        "local_files": local_files,
+        "failed": failed,
+        "manga_dir": manga_dir,
+    }
+
+
 async def on_chapter_select(update, context):
     query = update.callback_query
     await query.answer()
@@ -144,55 +188,20 @@ async def on_chapter_select(update, context):
     t0 = time.time()
 
     try:
-        html = fetch_manga_page(manga_id)
-        info = parse_manga_info(html, manga_id)
+        result = await _run_blocking(_do_download, manga_id, chapter_num)
+    except ValueError as e:
+        await query.edit_message_text(str(e))
+        return
     except Exception as e:
-        _prog_logger.error("fetch manga failed: %s", e)
-        await query.edit_message_text(f"获取漫画信息失败: {escape(str(e))}")
+        _prog_logger.error("download failed: %s", e)
+        await query.edit_message_text(f"下载失败: {escape(str(e))}")
         return
 
-    target = _find_chapter_by_display(info["chapters"], chapter_num)
-    if target is None:
-        await query.edit_message_text(f"未找到第 {chapter_num} 话")
-        return
-
-    chapter_name = target["chapter_name"]
-    manga_name = info.get("name", manga_id)
-
-    try:
-        chapter_html = fetch_chapter_page(target["url"])
-        image_urls = parse_chapter_images(chapter_html)
-    except Exception as e:
-        _prog_logger.error("fetch chapter images failed: %s", e)
-        await query.edit_message_text(f"获取图片列表失败: {escape(str(e))}")
-        return
-
-    if not image_urls:
-        await query.edit_message_text("未找到图片")
-        return
-
-    # 下载
-    manga_dir = os.path.join(DOWNLOAD_DIR, manga_id, str(chapter_num))
-    os.makedirs(manga_dir, exist_ok=True)
-    local_files = []
-    failed = 0
-
-    for i, img_url in enumerate(image_urls, 1):
-        ext = img_url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
-        if ext not in ("jpg", "jpeg", "png", "webp", "gif"):
-            ext = "jpg"
-        filepath = os.path.join(manga_dir, f"{i:03d}.{ext}")
-
-        try:
-            r = requests.get(img_url, timeout=30)
-            if r.status_code == 200:
-                with open(filepath, "wb") as f:
-                    f.write(r.content)
-                local_files.append(filepath)
-            else:
-                failed += 1
-        except Exception:
-            failed += 1
+    manga_name = result["manga_name"]
+    chapter_name = result["chapter_name"]
+    local_files = result["local_files"]
+    failed = result["failed"]
+    manga_dir = result["manga_dir"]
 
     if not local_files:
         await query.edit_message_text("所有图片下载失败")
