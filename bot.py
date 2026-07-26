@@ -1,8 +1,12 @@
 import asyncio
+import logging
 import os
 import re
 import shutil
+import sys
+import time
 from html import escape
+from logging.handlers import RotatingFileHandler
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
@@ -14,6 +18,43 @@ from config import DOWNLOAD_DIR
 from fetcher import fetch_manga_page, parse_manga_info, fetch_chapter_page, parse_chapter_images
 
 RECENT_COUNT = 20
+
+# --- 日志配置 ---
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+
+# 业务日志（文件），输出到 logs/ 目录
+_biz_logger = None
+
+
+def _get_biz_logger():
+    global _biz_logger
+    if _biz_logger is not None:
+        return _biz_logger
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    _biz_logger = logging.getLogger("manhua.biz")
+    _biz_logger.setLevel(logging.INFO)
+    _biz_logger.propagate = False
+
+    handler = RotatingFileHandler(
+        os.path.join(LOG_DIR, "bot.log"),
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    _biz_logger.addHandler(handler)
+    return _biz_logger
+
+
+# 程序日志（stdout → journalctl 自动捕获）
+_prog_logger = logging.getLogger("manhua")
+_prog_logger.setLevel(logging.INFO)
+_console = logging.StreamHandler(sys.stdout)
+_console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+_prog_logger.addHandler(_console)
 
 
 def _display_num(chapter_name):
@@ -44,21 +85,23 @@ async def cmd_recent(update, context):
         return
 
     manga_id = args[0]
+    user = update.effective_user
+    _prog_logger.info("recent request: manga=%s user=%s", manga_id, user.username or user.id)
+
     msg = await update.message.reply_text("正在获取章节列表…")
 
     try:
         html = fetch_manga_page(manga_id)
         info = parse_manga_info(html, manga_id)
     except Exception as e:
+        _prog_logger.error("fetch manga failed: %s", e)
         await msg.edit_text(f"获取漫画信息失败: {escape(str(e))}")
         return
 
     chapters = info.get("chapters", [])
-    # 过滤有有效显示编号的章节，取最近 RECENT_COUNT 个
     valid = [ch for ch in chapters if _display_num(ch["chapter_name"]) is not None]
     valid.sort(key=lambda ch: _display_num(ch["chapter_name"]), reverse=True)
     recent = valid[:RECENT_COUNT]
-    # 按编号升序排列便于阅读
     recent.sort(key=lambda ch: _display_num(ch["chapter_name"]))
 
     if not recent:
@@ -78,9 +121,8 @@ async def cmd_recent(update, context):
     if row:
         buttons.append(row)
 
-    # 上一页/下一页占位（后续可实现分页）
     await msg.edit_text(
-        f"📖 {name} — 最近章节",
+        f"{name} — 最近章节",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -95,15 +137,17 @@ async def on_chapter_select(update, context):
 
     _, manga_id, chapter_str = data.split("|", 2)
     chapter_num = int(chapter_str)
+    user = update.effective_user
+    _prog_logger.info("download request: manga=%s chapter=%s user=%s", manga_id, chapter_num, user.username or user.id)
 
-    # 判断是下载还是仅显示详情
-    text = query.message.text or ""
-    await query.edit_message_text(f"⏳ 正在下载第 {chapter_num} 话…")
+    await query.edit_message_text(f"正在下载第 {chapter_num} 话…")
+    t0 = time.time()
 
     try:
         html = fetch_manga_page(manga_id)
         info = parse_manga_info(html, manga_id)
     except Exception as e:
+        _prog_logger.error("fetch manga failed: %s", e)
         await query.edit_message_text(f"获取漫画信息失败: {escape(str(e))}")
         return
 
@@ -115,11 +159,11 @@ async def on_chapter_select(update, context):
     chapter_name = target["chapter_name"]
     manga_name = info.get("name", manga_id)
 
-    # 获取图片 URL
     try:
         chapter_html = fetch_chapter_page(target["url"])
         image_urls = parse_chapter_images(chapter_html)
     except Exception as e:
+        _prog_logger.error("fetch chapter images failed: %s", e)
         await query.edit_message_text(f"获取图片列表失败: {escape(str(e))}")
         return
 
@@ -127,10 +171,11 @@ async def on_chapter_select(update, context):
         await query.edit_message_text("未找到图片")
         return
 
-    # 下载图片
+    # 下载
     manga_dir = os.path.join(DOWNLOAD_DIR, manga_id, str(chapter_num))
     os.makedirs(manga_dir, exist_ok=True)
     local_files = []
+    failed = 0
 
     for i, img_url in enumerate(image_urls, 1):
         ext = img_url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
@@ -144,43 +189,42 @@ async def on_chapter_select(update, context):
                 with open(filepath, "wb") as f:
                     f.write(r.content)
                 local_files.append(filepath)
+            else:
+                failed += 1
         except Exception:
-            pass
+            failed += 1
 
     if not local_files:
         await query.edit_message_text("所有图片下载失败")
         shutil.rmtree(manga_dir, ignore_errors=True)
+        _get_biz_logger().warning("全部下载失败: %s #%s", manga_id, chapter_num)
         return
 
     total = len(local_files)
-    await query.edit_message_text(f"📤 正在上传到 {CHANNEL_ID} ({total} 张)…")
+    dl_sec = time.time() - t0
+    _prog_logger.info("downloaded %d/%d images (%.1fs), uploading...", total, total + failed, dl_sec)
 
-    # 按每组最多10张分批发送 media group
+    await query.edit_message_text(f"上传到 {CHANNEL_ID} ({total} 张)…")
+
+    # 上传
     batch_size = 10
     for batch_idx in range(0, total, batch_size):
         batch = local_files[batch_idx : batch_idx + batch_size]
         media_group = []
         for j, fp in enumerate(batch):
-            abs_path = os.path.abspath(fp)
-            # os.path.abspath 在 Windows 上生成反斜杠路径，需要转为正斜杠用于 file:// URI
-            abs_path = abs_path.replace("\\", "/")
+            abs_path = os.path.abspath(fp).replace("\\", "/")
             if batch_idx == 0 and j == 0:
-                caption = f"📖 {manga_name}\n{chapter_name} ({batch_idx + 1}/{total})"
+                caption = f"{manga_name}\n{chapter_name} ({batch_idx + 1}/{total})"
             else:
                 caption = None
             media_group.append(
-                InputMediaPhoto(
-                    media=open(abs_path, "rb"),
-                    caption=caption,
-                )
+                InputMediaPhoto(media=open(abs_path, "rb"), caption=caption)
             )
 
         try:
-            await context.bot.send_media_group(
-                chat_id=CHANNEL_ID,
-                media=media_group,
-            )
+            await context.bot.send_media_group(chat_id=CHANNEL_ID, media=media_group)
         except TelegramError as e:
+            _prog_logger.error("upload failed: %s", e)
             await query.edit_message_text(f"上传失败: {escape(str(e))}")
             shutil.rmtree(manga_dir, ignore_errors=True)
             return
@@ -188,22 +232,31 @@ async def on_chapter_select(update, context):
         if batch_idx + batch_size < total:
             await asyncio.sleep(1)
 
-    # 删除本地文件
+    # 清理
     shutil.rmtree(manga_dir, ignore_errors=True)
+    total_sec = time.time() - t0
+
+    biz = _get_biz_logger()
+    biz.info("上传完成: %s #%s | 图片=%d 失败=%d 耗时=%.1fs | 用户=%s",
+             manga_name, chapter_name, total, failed, total_sec,
+             user.username or user.id)
+
+    _prog_logger.info("upload done: %s #%s (%d imgs, %.1fs)", manga_id, chapter_num, total, total_sec)
 
     await query.edit_message_text(
-        f"✅ 已上传到 {CHANNEL_ID}\n{manga_name} — {chapter_name}\n共 {total} 张图片"
+        f"已上传到 {CHANNEL_ID}\n{manga_name} — {chapter_name}\n共 {total} 张 (耗时 {total_sec:.0f}s)"
     )
 
 
 def main():
+    _prog_logger.info("Bot starting...")
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("recent", cmd_recent))
     app.add_handler(CallbackQueryHandler(on_chapter_select))
 
-    print("Bot started. Press Ctrl+C to stop.")
+    _prog_logger.info("Bot polling...")
     app.run_polling()
 
 
