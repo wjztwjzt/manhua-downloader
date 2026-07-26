@@ -1,21 +1,42 @@
+import os
 import re
 import base64
 import requests
 from config import BASE_URL, MANGA_LIST_PATH, REQUEST_TIMEOUT
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G9910) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
+_session = None
+
+
+def _get_session():
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        _session.headers.update(HEADERS)
+        # 支持 HTTP_PROXY / HTTPS_PROXY 环境变量
+        proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+        if proxy:
+            _session.proxies = {"http": proxy, "https": proxy}
+    return _session
+
 
 def fetch_manga_page(manga_id):
     """获取漫画首页，返回 HTML 文本"""
     url = BASE_URL + MANGA_LIST_PATH.format(manga_id=manga_id)
-    resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+    resp = _get_session().get(url, timeout=REQUEST_TIMEOUT)
     resp.encoding = "gb2312"
+    resp.raise_for_status()
     return resp.text
 
 
 def _extract_chapters_from_js(html):
     """使用正则从 JS 中提取所有章节条目，避免完整 JSON 解析（数据可能有无效转义）"""
     chapters = []
-    # 匹配每个章节对象: { "id": ..., "comic_id": ..., "chapter_name": "...", "chapter_order": ..., ... "h":"..." }
     for m in re.finditer(
         r'\{\s*"id":\s*(\d+).*?"comic_id":\s*(\d+).*?"chapter_name":\s*"((?:[^"\\]|\\.)*)".*?"chapter_order":\s*(-?\d+).*?"h":\s*"(http://m\.gugu5\.com[^"]+)"',
         html, re.DOTALL
@@ -34,17 +55,14 @@ def parse_manga_info(html, manga_id):
     """从漫画首页解析漫画基本信息和章节列表"""
     info = {}
 
-    # 漫画名称
     m = re.search(r'id="comicName"[^>]*>([^<]+)<', html)
     if m:
         info["name"] = m.group(1).strip()
 
-    # 封面图
     m = re.search(r'id="Cover"[^>]*>.*?<img\s+src="([^"]+)"', html, re.DOTALL)
     if m:
         info["cover_url"] = m.group(1)
 
-    # 描述
     m = re.search(r'class="txtDesc[^"]*"[^>]*>([^<]+)', html)
     if m:
         info["description"] = m.group(1).strip()
@@ -56,8 +74,9 @@ def parse_manga_info(html, manga_id):
 def fetch_chapter_page(chapter_url):
     """获取章节页面，返回 HTML 文本"""
     url = BASE_URL + chapter_url
-    resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+    resp = _get_session().get(url, timeout=REQUEST_TIMEOUT)
     resp.encoding = "gb2312"
+    resp.raise_for_status()
     return resp.text
 
 
